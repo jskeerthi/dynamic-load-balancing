@@ -1,0 +1,415 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+
+// ---------------- CONFIG ----------------
+const char* ssid = "YOUR_SSID";
+const char* password = "YOUR_PASS";
+
+const char* mqtt_server = "192.168.1.50";
+const uint16_t mqtt_port = 1883;
+const char* device_id = "feeder_node_01_v2";
+
+const float V_NOMINAL = 230.0f;            // assumed line voltage (VAC)
+const unsigned long SAMPLE_WINDOW_MS = 1000; // RMS window
+const unsigned long TELEMETRY_INTERVAL_MS = 5000;
+const unsigned long MIN_SWITCH_INTERVAL_MS = 60UL * 1000UL; // 60s
+const float T_HIGH = 800.0f;   // high threshold (W) to trigger switching
+const float T_LOW  = 400.0f;   // low threshold (W) to stop switching (hysteresis)
+const int ADC_BITS = 12;
+const int ADC_MAX = (1 << ADC_BITS) - 1;
+const float ADC_TO_VOLT = 3.3f / ADC_MAX; // ESP32 ADC reference approx
+
+// --------------- PINS -------------------
+const int PIN_CT_A = 36; // ADC1_CH0
+const int PIN_CT_B = 39; // ADC1_CH3
+const int PIN_CT_C = 34; // ADC1_CH6
+
+const int RELAY_AB = 16; // switches a load group between A<->B
+const int RELAY_BC = 17; // switches a load group between B<->C
+const int RELAY_CA = 18; // switches a load group between C<->A
+const int LED_PIN  = 2;
+
+// MQTT topics
+String base_topic;
+String telemetry_topic;
+String cmd_topic;
+String state_topic;
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// ---------------- runtime ----------------
+unsigned long lastTelemetry = 0;
+unsigned long lastSwitchTime = 0;
+bool PV_mode = true; // only auto-balance when PV_mode==true. Can be toggled via MQTT.
+String lastAction = "none";
+
+// Phase data
+struct Phase {
+  int adcPin;
+  float Irms;   // A
+  float P;      // W
+};
+Phase phases[3];
+
+// Load groups mapping and relay control model:
+// We assume each relay toggles a pre-defined group of loads between two phases.
+// For prototype, we map groups to relays; groups have sizes and priority.
+struct LoadGroup {
+  String name;
+  int relayPin;      // which relay is used to move this group
+  float size_W;      // size of this group in Watts (approx)
+  bool shiftable;    // whether this group can be shifted automatically
+  int currentPhase;  // 0=A,1=B,2=C - which phase it's currently connected to
+  bool relayState;   // 0=default,1=toggled
+};
+
+#define NGROUPS 6
+LoadGroup groups[NGROUPS] = {
+  // name, relayPin, size_W, shiftable, currentPhase, relayState
+  {"G1", RELAY_AB, 500.0f, true, 0, false}, // G1 attached initially to Phase A
+  {"G2", RELAY_AB, 700.0f, true, 0, false},
+  {"G3", RELAY_BC, 900.0f, true, 1, false},
+  {"G4", RELAY_BC, 400.0f, false,1, false}, // non-shiftable (critical)
+  {"G5", RELAY_CA, 600.0f, true, 2, false},
+  {"G6", RELAY_CA, 300.0f, true, 2, false}
+};
+
+// calibration factors per CT channel (ADC-voltage to amps). Tune these.
+float CT_mV_per_A = 66.0f; // placeholder (mV per amp) - replace with real sensor value
+float burdenResistor = 0.0f; // if using specific burden set, else keep zero and calibrate differently
+float channelScale[3] = {1.0f, 1.0f, 1.0f}; // fine calibration multipliers per channel
+
+// ----------------- helpers -----------------
+void publishState(const String &stateJson) {
+  client.publish(state_topic.c_str(), stateJson.c_str());
+}
+
+void publishTelemetry() {
+  StaticJsonDocument<512> doc;
+  doc["device"] = device_id;
+  JsonArray Ir = doc.createNestedArray("I_rms");
+  JsonArray P  = doc.createNestedArray("P_w");
+  for (int i=0;i<3;i++){
+    Ir.add(phases[i].Irms);
+    P.add(phases[i].P);
+  }
+  doc["last_action"] = lastAction;
+  doc["PV_mode"] = PV_mode;
+  // groups info
+  JsonArray garr = doc.createNestedArray("groups");
+  for (int i=0;i<NGROUPS;i++){
+    JsonObject g = garr.createNestedObject();
+    g["name"] = groups[i].name;
+    g["size_w"] = groups[i].size_W;
+    g["shiftable"] = groups[i].shiftable;
+    g["phase"] = groups[i].currentPhase;
+    g["relay"] = groups[i].relayState;
+  }
+  char buf[512];
+  size_t n = serializeJson(doc, buf, sizeof(buf));
+  client.publish(telemetry_topic.c_str(), buf, n);
+}
+
+// Simple RMS prototype: sample ADC for window_ms, assume sensor biased Vcc/2.
+float measureIrmsPrototype(int adcPin, unsigned long window_ms) {
+  unsigned long start = millis();
+  unsigned long cnt = 0;
+  double sumSq = 0.0;
+  while (millis() - start < window_ms) {
+    int raw = analogRead(adcPin);
+    float v = raw * ADC_TO_VOLT;        // measured voltage at ADC pin
+    float vCentered = v - (3.3f/2.0f);  // assuming sensor mid-bias at Vcc/2
+    // convert vCentered -> amps using calibration; for now return voltage-based RMS
+    sumSq += (double)(vCentered * vCentered);
+    cnt++;
+    delay(2); // spacing samples; fine-tune for better resolution
+  }
+  if (cnt==0) return 0.0f;
+  float Vrms = sqrt(sumSq / (double)cnt);
+  // crude conversion: Vrms -> I using channelScale (needs real calibration)
+  float I_est = Vrms * channelScale[0]; // will be adjusted per phase outside
+  return I_est;
+}
+
+// Find index of max/min P
+int idxMaxP() {
+  int idx = 0;
+  for (int i=1;i<3;i++) if (phases[i].P > phases[idx].P) idx = i;
+  return idx;
+}
+int idxMinP() {
+  int idx = 0;
+  for (int i=1;i<3;i++) if (phases[i].P < phases[idx].P) idx = i;
+  return idx;
+}
+
+// Toggle relay output safely (active HIGH assumed). Also update group's relayState and mapping.
+void setRelay(int relayPin, bool state) {
+  digitalWrite(relayPin, state ? HIGH : LOW);
+  // update all groups using this relay to reflect toggled state and adjust phase mapping:
+  for (int i=0;i<NGROUPS;i++) {
+    if (groups[i].relayPin == relayPin) {
+      if (groups[i].shiftable) {
+        // Changing relay toggles the group between two phases depending on relay mapping:
+        // Mapping used: RELAY_AB toggles between A(0) and B(1)
+        // RELAY_BC toggles between B(1) and C(2)
+        // RELAY_CA toggles between C(2) and A(0)
+        int before = groups[i].currentPhase;
+        if (relayPin == RELAY_AB) {
+          groups[i].currentPhase = state ? 1 : 0;
+        } else if (relayPin == RELAY_BC) {
+          groups[i].currentPhase = state ? 2 : 1;
+        } else if (relayPin == RELAY_CA) {
+          groups[i].currentPhase = state ? 0 : 2;
+        }
+        groups[i].relayState = state;
+        Serial.printf("Group %s moved %d -> %d via relay %d\n",
+                      groups[i].name.c_str(), before, groups[i].currentPhase, relayPin);
+      }
+    }
+  }
+}
+
+// Select minimal set of shiftable groups from overloaded phase to move toward target.
+// Returns list of group indices to actuate (toggle).
+// Strategy: greedy subset sum trying to reach requiredShift >= needed
+#include <vector>
+std::vector<int> chooseGroupsToMove(int fromPhase, int toPhase, float neededShift) {
+  // collect candidate groups that are on fromPhase and shiftable and mapped to the relay between the phases
+  struct Cand { int idx; float size; int relay; };
+  std::vector<Cand> cands;
+  for (int i=0;i<NGROUPS;i++) {
+    if (!groups[i].shiftable) continue;
+    if (groups[i].currentPhase != fromPhase) continue;
+    // check relay mapping ensures moving between the two phases:
+    int r = groups[i].relayPin;
+    bool maps=false;
+    if ((fromPhase==0 && toPhase==1 && r==RELAY_AB) ||
+        (fromPhase==1 && toPhase==0 && r==RELAY_AB)) maps=true;
+    if ((fromPhase==1 && toPhase==2 && r==RELAY_BC) ||
+        (fromPhase==2 && toPhase==1 && r==RELAY_BC)) maps=true;
+    if ((fromPhase==2 && toPhase==0 && r==RELAY_CA) ||
+        (fromPhase==0 && toPhase==2 && r==RELAY_CA)) maps=true;
+    if (!maps) continue;
+    cands.push_back({i, groups[i].size_W, r});
+  }
+  // sort candidates descending by size (greedy)
+  std::sort(cands.begin(), cands.end(), [](const Cand &a, const Cand &b){ return a.size > b.size; });
+
+  std::vector<int> picked;
+  float sum = 0.0f;
+  for (auto &c : cands) {
+    if (sum >= neededShift) break;
+    picked.push_back(c.idx);
+    sum += c.size;
+  }
+  // If sum still < neededShift, we still return picked (best-effort).
+  return picked;
+}
+
+// Core balancing decision
+void balancingStep() {
+  // compute P per phase
+  for (int i=0;i<3;i++) phases[i].P = V_NOMINAL * phases[i].Irms;
+
+  int imax = idxMaxP();
+  int imin = idxMinP();
+  float diff = phases[imax].P - phases[imin].P;
+  Serial.printf("P: [%.0f, %.0f, %.0f] diff=%.0f W\n", phases[0].P, phases[1].P, phases[2].P, diff);
+
+  // hysteresis: only act when PV_mode ON and diff > T_HIGH; stop when <= T_LOW
+  static bool inBalancingMode = false;
+  if (!inBalancingMode) {
+    if (PV_mode && diff > T_HIGH) {
+      inBalancingMode = true;
+      Serial.println("Entering balancing mode");
+    } else {
+      lastAction = "no_action";
+      return;
+    }
+  } else {
+    if (diff <= T_LOW) {
+      inBalancingMode = false;
+      Serial.println("Leaving balancing mode (hysteresis satisfied)");
+      lastAction = "hysteresis_stop";
+      return;
+    }
+  }
+
+  unsigned long now = millis();
+  if (now - lastSwitchTime < MIN_SWITCH_INTERVAL_MS) {
+    Serial.println("Switch blocked: min interval not yet passed");
+    lastAction = "blocked_interval";
+    return;
+  }
+
+  // compute required shift to reduce difference by half (or to target)
+  float totalP = phases[0].P + phases[1].P + phases[2].P;
+  float P_target = totalP / 3.0f; // fair target
+  float neededShift = phases[imax].P - P_target; // how much W to move from imax to others
+  if (neededShift <= 0) {
+    lastAction = "no_needed_shift";
+    return;
+  }
+
+  // choose groups from imax to move to imin
+  std::vector<int> toMove = chooseGroupsToMove(imax, imin, neededShift);
+
+  if (toMove.empty()) {
+    Serial.println("No candidate groups to move from overloaded phase");
+    lastAction = "no_candidates";
+    return;
+  }
+
+  // actuate relays for chosen groups (toggle relay state)
+  // Note: groups share relay pins; toggling one relay may move multiple groups controlled by same relay
+  // We'll toggle the relay pin associated with each chosen group.
+  std::vector<int> relaysToggled;
+  for (int gi : toMove) {
+    int r = groups[gi].relayPin;
+    // toggle relay state (simple toggle)
+    bool newState = !groups[gi].relayState;
+    // ensure we only toggle each relay once per balancing step
+    if (std::find(relaysToggled.begin(), relaysToggled.end(), r) == relaysToggled.end()) {
+      setRelay(r, newState);
+      relaysToggled.push_back(r);
+      delay(200); // short interlock delay between toggles (hardware must ensure safety)
+    }
+  }
+
+  lastSwitchTime = now;
+  lastAction = "moved_groups";
+  Serial.printf("Moved %d groups via %d relays\n", (int)toMove.size(), (int)relaysToggled.size());
+}
+
+// ---------------- MQTT ----------------
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (unsigned int i=0;i<length;i++) msg += (char)payload[i];
+  Serial.printf("MQTT recv topic=%s msg=%s\n", topic, msg.c_str());
+  // simple parsing: expect JSON like {"cmd":"set_PV","pv":1} or {"cmd":"relay","name":"G1","state":1}
+  StaticJsonDocument<256> doc;
+  DeserializationError err = deserializeJson(doc, msg);
+  if (!err) {
+    const char* cmd = doc["cmd"];
+    if (cmd) {
+      if (String(cmd) == "set_PV") {
+        PV_mode = doc["pv"];
+        Serial.printf("PV_mode set to %d\n", PV_mode);
+      } else if (String(cmd) == "force_balance") {
+        // force immediate balancing attempt
+        balancingStep();
+      } else if (String(cmd) == "set_relay") {
+        const char* gname = doc["group"];
+        int state = doc["state"];
+        if (gname) {
+          for (int i=0;i<NGROUPS;i++) {
+            if (groups[i].name == String(gname)) {
+              setRelay(groups[i].relayPin, state);
+              break;
+            }
+          }
+        }
+      }
+    }
+  } else {
+    Serial.println("MQTT payload not JSON - ignored");
+  }
+}
+
+void reconnectMQTT() {
+  while (!client.connected()) {
+    Serial.print("Connecting MQTT...");
+    if (client.connect(device_id)) {
+      Serial.println("connected");
+      client.subscribe(cmd_topic.c_str());
+      // publish online state
+      StaticJsonDocument<200> doc;
+      doc["device"] = device_id;
+      doc["status"] = "online";
+      char buf[200]; size_t n = serializeJson(doc, buf);
+      client.publish(state_topic.c_str(), buf, n);
+    } else {
+      Serial.printf("failed rc=%d, retry in 2s\n", client.state());
+      delay(2000);
+    }
+  }
+}
+
+// ---------------- setup / loop ----------------
+void setupPins() {
+  pinMode(RELAY_AB, OUTPUT);
+  pinMode(RELAY_BC, OUTPUT);
+  pinMode(RELAY_CA, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(RELAY_AB, LOW);
+  digitalWrite(RELAY_BC, LOW);
+  digitalWrite(RELAY_CA, LOW);
+  digitalWrite(LED_PIN, LOW);
+}
+
+void setupPhases() {
+  phases[0].adcPin = PIN_CT_A;
+  phases[1].adcPin = PIN_CT_B;
+  phases[2].adcPin = PIN_CT_C;
+  for (int i=0;i<3;i++) { phases[i].Irms = 0; phases[i].P = 0; }
+}
+
+void setup() {
+  Serial.begin(115200);
+  analogReadResolution(ADC_BITS);
+
+  setupPins();
+  setupPhases();
+
+  base_topic = String("ksebl/feeder/") + device_id;
+  telemetry_topic = base_topic + "/telemetry";
+  cmd_topic = base_topic + "/cmd";
+  state_topic = base_topic + "/state";
+
+  // WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("WiFi connecting");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300); Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("IP: "); Serial.println(WiFi.localIP());
+
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(mqttCallback);
+
+  lastTelemetry = millis();
+}
+
+void loop() {
+  if (!client.connected()) reconnectMQTT();
+  client.loop();
+
+  // 1) measure Irms per phase (prototype)
+  for (int i=0;i<3;i++) {
+    // we return a voltage-based Vrms in prototype; convert to amps by per-channel calibration
+    float Vrms = measureIrmsPrototype(phases[i].adcPin, SAMPLE_WINDOW_MS);
+    // TODO: Replace the following conversion with real sensor calibration:
+    // If CT_mV_per_A provided: I = (Vrms * 1000) / CT_mV_per_A
+    float I_est = (Vrms * 1000.0f) / (CT_mV_per_A + 0.0001f); // avoid div0
+    I_est *= channelScale[i];
+    phases[i].Irms = I_est;
+  }
+
+  // 2) balancing decision (only if PV_mode or forced)
+  balancingStep();
+
+  // 3) telemetry
+  unsigned long now = millis();
+  if (now - lastTelemetry >= TELEMETRY_INTERVAL_MS) {
+    lastTelemetry = now;
+    publishTelemetry();
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+  }
+
+  delay(50);
+}
