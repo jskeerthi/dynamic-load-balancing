@@ -1,0 +1,27 @@
+# Example: Dynamic Load Balancing for 3-phase feeder
+# Simulated real-time loads (in Watts)
+
+phase_loads = [4200, 3000, 2500]  # Phase A, B, C
+
+THRESHOLD = 500  # Watts imbalance allowed
+
+def balance_loads(phase_loads):
+    max_phase = phase_loads.index(max(phase_loads))
+    min_phase = phase_loads.index(min(phase_loads))
+    
+    diff = phase_loads[max_phase] - phase_loads[min_phase]
+    
+    if diff > THRESHOLD:
+        shift = diff // 2   # Amount of load to shift
+        phase_loads[max_phase] -= shift
+        phase_loads[min_phase] += shift
+        print(f"Shifted {shift}W from Phase {max_phase+1} to Phase {min_phase+1}")
+    else:
+        print("System is balanced within threshold.")
+    
+    return phase_loads
+
+# Run balancing
+print("Before:", phase_loads)
+phase_loads = balance_loads(phase_loads)
+print("After:", phase_loads)
