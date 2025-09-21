@@ -1,0 +1,39 @@
+START
+
+1. Initialize ESP32:
+   - Setup ADC pins for current sensors on Phase A, Phase B, Phase C
+   - Setup Relay pins for load shifting
+   - (Optional) Setup WiFi + MQTT for communication
+
+2. Define constants:
+   - V_NOMINAL = 230 V
+   - THRESHOLD = 500 W (allowed imbalance)
+
+3. LOOP forever:
+   a) Read current sensors:
+      Ia = read_ADC(PinA)
+      Ib = read_ADC(PinB)
+      Ic = read_ADC(PinC)
+
+   b) Calculate power on each phase:
+      Pa = Ia * V_NOMINAL
+      Pb = Ib * V_NOMINAL
+      Pc = Ic * V_NOMINAL
+
+   c) Find imbalance:
+      maxP = maximum(Pa, Pb, Pc)
+      minP = minimum(Pa, Pb, Pc)
+      diff = maxP - minP
+
+   d) Decision:
+      IF diff > THRESHOLD THEN
+         → Activate relay to move load 
+         (from phase with maxP → to phase with minP)
+         Print "⚡ Imbalance detected, switching..."
+      ELSE
+         → Keep relay OFF (normal state)
+         Print "✅ Balanced"
+
+   e) Wait for 2 seconds
+
+REPEAT
